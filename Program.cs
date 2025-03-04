@@ -1,7 +1,9 @@
-﻿using System;
+﻿
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -23,21 +25,27 @@ class Program
         List<Point> points = ReadExcelFile(ExcelFilePath);
         Console.WriteLine($"Загружено {points.Count} точек из Excel файла.");
 
+        HashSet<string> excludedCities = ReadExcludedCities(ExcelFilePath);
+        Console.WriteLine($"Загружено {excludedCities.Count} городов из списка исключений.");
+
+
         var results = new List<(Point Point, Settlement Settlement, string ErrorMessage)>();
         int processed = 0, errors = 0;
+        HashSet<string> foundCities = new HashSet<string>(); //  Чтобы города не дублировались
 
         foreach (var point in points)
         {
-            var result = await FindNearestSettlementWithRetry(point);
+            var result = await FindNearestSettlementWithRetry(point, excludedCities, foundCities);
             results.Add((point, result.Settlement, result.ErrorMessage));
 
             if (result.Settlement != null)
             {
+                foundCities.Add(result.Settlement.Name); //  Добавляем город в список найденных
                 var popInfo = result.Settlement.Population.HasValue
                     ? $"Население: {result.Settlement.Population:N0}"
                     : "Население: Н/Д";
                 Console.WriteLine($"[{processed + 1}/{points.Count}] {result.Settlement.Name} " +
-                                $"{result.Settlement.Distance:F2} км | {popInfo}");
+                                  $"{result.Settlement.Distance:F2} км | {popInfo}");
             }
             else
             {
@@ -60,6 +68,8 @@ class Program
         using (var stream = File.Open(path, FileMode.Open, FileAccess.Read))
         using (var reader = ExcelReaderFactory.CreateReader(stream))
         {
+            // Читаем первый лист (нулевой индекс)
+            reader.Read(); // Пропускаем строку заголовка
             while (reader.Read())
             {
                 if (reader.FieldCount < 2) continue;
@@ -78,12 +88,43 @@ class Program
         return points;
     }
 
-    static async Task<(Settlement Settlement, string ErrorMessage)> FindNearestSettlementWithRetry(Point point)
+    static HashSet<string> ReadExcludedCities(string path)
+    {
+        var excludedCities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        using (var stream = File.Open(path, FileMode.Open, FileAccess.Read))
+        using (var reader = ExcelReaderFactory.CreateReader(stream))
+        {
+            // Переходим ко второму листу (индекс 1)
+            if (reader.ResultsCount > 1)
+            {
+                reader.Read(); // Пропускаем первый лист
+                reader.NextResult(); // Переходим на второй лист
+                reader.Read(); //Пропускаем заголовок
+
+                while (reader.Read())
+                {
+                    if (reader.FieldCount > 0)
+                    {
+                        var cityName = reader.GetString(0)?.Trim();
+                        if (!string.IsNullOrEmpty(cityName))
+                        {
+                            excludedCities.Add(cityName);
+                        }
+                    }
+                }
+            }
+        }
+
+        return excludedCities;
+    }
+
+    static async Task<(Settlement Settlement, string ErrorMessage)> FindNearestSettlementWithRetry(Point point, HashSet<string> excludedCities, HashSet<string> foundCities)
     {
         int retry = 0;
         while (retry < MaxRetries)
         {
-            var result = await FindNearestSettlement(point);
+            var result = await FindNearestSettlement(point, excludedCities, foundCities);
             if (result.ErrorMessage == null || !result.ErrorMessage.Contains("Too Many Requests"))
                 return result;
 
@@ -93,7 +134,7 @@ class Program
         return (null, "Превышено количество попыток запроса");
     }
 
-    static async Task<(Settlement Settlement, string ErrorMessage)> FindNearestSettlement(Point point)
+    static async Task<(Settlement Settlement, string ErrorMessage)> FindNearestSettlement(Point point, HashSet<string> excludedCities, HashSet<string> foundCities)
     {
         try
         {
@@ -103,9 +144,9 @@ class Program
             var query = $@"
                 [out:json][timeout:30];
                 (
-                    node[place~'city|town'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
-                    way[place~'city|town'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
-                    relation[place~'city|town'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
+                    node[place~'city|town|village'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
+                    way[place~'city|town|village'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
+                    relation[place~'city|town|village'](around:100000, {lat.ToString(CultureInfo.InvariantCulture)}, {lon.ToString(CultureInfo.InvariantCulture)});
                 );
                 out center;
             ";
@@ -120,7 +161,7 @@ class Program
             if (content.StartsWith("<"))
                 return (null, "Ошибка сервера: получен HTML вместо JSON");
 
-            return ParseResponse(content, lat, lon);
+            return ParseResponse(content, lat, lon, excludedCities, foundCities);
         }
         catch (Exception ex)
         {
@@ -129,7 +170,7 @@ class Program
         }
     }
 
-    static (Settlement, string) ParseResponse(string json, double srcLat, double srcLon)
+    static (Settlement, string) ParseResponse(string json, double srcLat, double srcLon, HashSet<string> excludedCities, HashSet<string> foundCities)
     {
         try
         {
@@ -138,8 +179,8 @@ class Program
             if (elements == null || elements.Count == 0)
                 return (null, "Поселений не найдено");
 
-            Settlement nearest = null;
-            double minDist = double.MaxValue;
+            //  Список всех подходящих поселений
+            List<Settlement> possibleSettlements = new List<Settlement>();
 
             foreach (var el in elements)
             {
@@ -160,24 +201,37 @@ class Program
                 if (string.IsNullOrEmpty(name)) continue;
 
                 var dist = HaversineDistance(srcLat, srcLon, lat.Value, lon.Value);
-                if (dist < minDist)
+
+                possibleSettlements.Add(new Settlement
                 {
-                    minDist = dist;
-                    nearest = new Settlement
-                    {
-                        Name = name,
-                        Type = type ?? "unknown",
-                        Latitude = lat.Value,
-                        Longitude = lon.Value,
-                        Distance = dist,
-                        Population = population
-                    };
+                    Name = name,
+                    Type = type ?? "unknown",
+                    Latitude = lat.Value,
+                    Longitude = lon.Value,
+                    Distance = dist,
+                    Population = population
+                });
+            }
+
+            // Сортируем поселения по приоритету (сначала население, затем расстояние)
+            var prioritizedSettlements = possibleSettlements
+                .OrderByDescending(s => s.Population.GetValueOrDefault(0))
+                .ThenBy(s => s.Distance)
+                .ToList();
+
+            //  Выбираем лучшее поселение, не входящее в список исключений и не дублирующееся
+            foreach (var settlement in prioritizedSettlements)
+            {
+                if (!excludedCities.Contains(settlement.Name) && !foundCities.Contains(settlement.Name))
+                {
+                    return (settlement, null);
                 }
             }
 
-            return nearest != null
-                ? (nearest, null)
-                : (null, "Не удалось распознать поселения");
+            //  Если не найдено подходящих поселений
+            return (null, "Не найдено подходящих поселений (все исключены или дублируются)");
+
+
         }
         catch (Exception ex)
         {
@@ -270,8 +324,8 @@ class Program
                     ws.Cell(row, 6).Value = r.Settlement.Latitude;
                     ws.Cell(row, 7).Value = Math.Round(r.Settlement.Distance, 2);
                     ws.Cell(row, 8).Value = r.Settlement.Population.HasValue
-     ? r.Settlement.Population.Value
-     : "Н/Д";
+                        ? r.Settlement.Population.Value
+                        : "Н/Д";
                     ws.Cell(row, 9).Value = "OK";
                 }
                 else
