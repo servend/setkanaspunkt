@@ -1,5 +1,4 @@
-﻿
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -10,6 +9,8 @@ using System.Threading.Tasks;
 using ClosedXML.Excel;
 using ExcelDataReader;
 using Newtonsoft.Json.Linq;
+using NetTopologySuite.Geometries;
+using NetTopologySuite.IO;
 
 class Program
 {
@@ -17,10 +18,21 @@ class Program
     private const string ExcelFilePath = @"C:\Users\User\Desktop\grid.xlsx";
     private const int MaxRetries = 3;
     private const int BaseDelayMs = 2000;
+    private static Geometry russianBorder;
+    private const int DelayBetweenRequestsMs = 2000; // Увеличено время задержки между запросами
+    private const int MinPopulation = 20000;
+    private const int MaxPopulation = 50000;
 
     static async Task Main(string[] args)
     {
         System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
+        russianBorder = await GetRussianBorder();
+        if (russianBorder == null)
+        {
+            Console.WriteLine("Не удалось получить границу России. Работа программы будет прекращена.");
+            return;
+        }
 
         List<Point> points = ReadExcelFile(ExcelFilePath);
         Console.WriteLine($"Загружено {points.Count} точек из Excel файла.");
@@ -28,10 +40,9 @@ class Program
         HashSet<string> excludedCities = ReadExcludedCities(ExcelFilePath);
         Console.WriteLine($"Загружено {excludedCities.Count} городов из списка исключений.");
 
-
         var results = new List<(Point Point, Settlement Settlement, string ErrorMessage)>();
         int processed = 0, errors = 0;
-        HashSet<string> foundCities = new HashSet<string>(); //  Чтобы города не дублировались
+        HashSet<string> foundCities = new HashSet<string>();
 
         foreach (var point in points)
         {
@@ -40,7 +51,7 @@ class Program
 
             if (result.Settlement != null)
             {
-                foundCities.Add(result.Settlement.Name); //  Добавляем город в список найденных
+                foundCities.Add(result.Settlement.Name);
                 var popInfo = result.Settlement.Population.HasValue
                     ? $"Население: {result.Settlement.Population:N0}"
                     : "Население: Н/Д";
@@ -54,11 +65,57 @@ class Program
             }
 
             processed++;
-            await Task.Delay(1000);
+            await Task.Delay(DelayBetweenRequestsMs); // Используем увеличенную задержку
         }
 
         SaveResults(results, ExcelFilePath);
         Console.WriteLine($"\nГотово! Обработано: {processed}, Ошибок: {errors}");
+    }
+
+    static async Task<Geometry> GetRussianBorder()
+    {
+        Console.WriteLine("Получение границы России...");
+
+        string geoJsonUrl = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries/RUS.geo.json";
+
+        try
+        {
+            using (var client = new HttpClient())
+            {
+                var response = await client.GetStringAsync(geoJsonUrl);
+                Console.WriteLine("GeoJSON получен успешно.");
+
+                if (string.IsNullOrEmpty(response))
+                {
+                    throw new Exception("Получен пустой ответ от сервера.");
+                }
+
+                var reader = new GeoJsonReader();
+                var featureCollection = reader.Read<NetTopologySuite.Features.FeatureCollection>(response);
+
+                if (featureCollection == null || featureCollection.Count == 0)
+                {
+                    throw new Exception("Не удалось прочитать FeatureCollection из GeoJSON.");
+                }
+
+                var feature = featureCollection[0];
+                var geometry = feature.Geometry;
+
+                if (geometry == null)
+                {
+                    throw new Exception("Геометрия в Feature отсутствует.");
+                }
+
+                Console.WriteLine($"Граница России получена успешно. Тип геометрии: {geometry.GeometryType}");
+                return geometry;
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Ошибка при получении границы России: {e.Message}");
+            Console.WriteLine($"Stack Trace: {e.StackTrace}");
+            return null;
+        }
     }
 
     static List<Point> ReadExcelFile(string path)
@@ -68,8 +125,7 @@ class Program
         using (var stream = File.Open(path, FileMode.Open, FileAccess.Read))
         using (var reader = ExcelReaderFactory.CreateReader(stream))
         {
-            // Читаем первый лист (нулевой индекс)
-            reader.Read(); // Пропускаем строку заголовка
+            reader.Read();
             while (reader.Read())
             {
                 if (reader.FieldCount < 2) continue;
@@ -95,12 +151,11 @@ class Program
         using (var stream = File.Open(path, FileMode.Open, FileAccess.Read))
         using (var reader = ExcelReaderFactory.CreateReader(stream))
         {
-            // Переходим ко второму листу (индекс 1)
             if (reader.ResultsCount > 1)
             {
-                reader.Read(); // Пропускаем первый лист
-                reader.NextResult(); // Переходим на второй лист
-                reader.Read(); //Пропускаем заголовок
+                reader.Read();
+                reader.NextResult();
+                reader.Read();
 
                 while (reader.Read())
                 {
@@ -170,6 +225,7 @@ class Program
         }
     }
 
+
     static (Settlement, string) ParseResponse(string json, double srcLat, double srcLon, HashSet<string> excludedCities, HashSet<string> foundCities)
     {
         try
@@ -179,13 +235,19 @@ class Program
             if (elements == null || elements.Count == 0)
                 return (null, "Поселений не найдено");
 
-            //  Список всех подходящих поселений
             List<Settlement> possibleSettlements = new List<Settlement>();
 
             foreach (var el in elements)
             {
                 var (lat, lon) = GetCoordinates(el);
                 if (!lat.HasValue || !lon.HasValue) continue;
+
+                var point = new NetTopologySuite.Geometries.Point(lon.Value, lat.Value);
+                if (russianBorder != null && !russianBorder.Contains(point))
+                {
+                    continue;
+                }
+
 
                 var tags = el["tags"];
                 var name = tags?["name"]?.ToString();
@@ -213,14 +275,22 @@ class Program
                 });
             }
 
-            // Сортируем поселения по приоритету (сначала население, затем расстояние)
-            var prioritizedSettlements = possibleSettlements
-                .OrderByDescending(s => s.Population.GetValueOrDefault(0))
-                .ThenBy(s => s.Distance)
+            // Фильтрация поселений по населению
+            var filteredSettlements = possibleSettlements
+                .Where(s => s.Population.HasValue && s.Population >= MinPopulation && s.Population <= MaxPopulation)
                 .ToList();
 
-            //  Выбираем лучшее поселение, не входящее в список исключений и не дублирующееся
-            foreach (var settlement in prioritizedSettlements)
+            if (filteredSettlements.Count == 0)
+            {
+                return (null, "Не найдено поселений с населением от 20000 до 50000");
+            }
+
+            // Сортировка отфильтрованных поселений по расстоянию
+            var nearestSettlements = filteredSettlements
+                .OrderBy(s => s.Distance)
+                .ToList();
+
+            foreach (var settlement in nearestSettlements)
             {
                 if (!excludedCities.Contains(settlement.Name) && !foundCities.Contains(settlement.Name))
                 {
@@ -228,10 +298,7 @@ class Program
                 }
             }
 
-            //  Если не найдено подходящих поселений
             return (null, "Не найдено подходящих поселений (все исключены или дублируются)");
-
-
         }
         catch (Exception ex)
         {
@@ -298,7 +365,6 @@ class Program
         {
             var ws = wb.Worksheets.Add("Результаты");
 
-            // Заголовки
             ws.Cell("A1").Value = "Исходная долгота";
             ws.Cell("B1").Value = "Исходная широта";
             ws.Cell("C1").Value = "Название";
@@ -309,7 +375,6 @@ class Program
             ws.Cell("H1").Value = "Население";
             ws.Cell("I1").Value = "Статус";
 
-            // Данные
             int row = 2;
             foreach (var r in results)
             {
